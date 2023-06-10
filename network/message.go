@@ -5,9 +5,10 @@ import "encoding/json"
 type MessageType int
 
 const (
-	TxMessaege MessageType = iota
+	TxMessage MessageType = iota
 	BlockMessage
 	GetDataMessage
+	InitMessage
 )
 
 type Message struct {
@@ -24,8 +25,3 @@ func DeserializeMessage(data []byte) (*Message, error) {
 	err := json.Unmarshal(data, msg)
 	return msg, err
 }
-
-// establish a way to comunicate (send messages)
-// sync blockchain
-// propagate Tx
-// propagate Block
