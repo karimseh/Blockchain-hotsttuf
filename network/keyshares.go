@@ -14,8 +14,17 @@ type KeyShare struct {
 	NoncePub ted25519.PublicKey
 }
 
+// NumParties is the total number of consensus participants (n = 3t + 1).
+const NumParties = 4
+
+// FaultyThreshold is the max number of Byzantine faults tolerated (t).
+const FaultyThreshold = 1
+
+// Quorum is the minimum votes needed for a certificate (2t + 1).
+const Quorum = 2*FaultyThreshold + 1 // = 3
+
 func NewKeyShareMap() map[int]KeyShare {
-	config := ted25519.ShareConfiguration{T: 2, N: 4}
+	config := ted25519.ShareConfiguration{T: Quorum, N: NumParties}
 	pub, secretShares, _, _ := ted25519.GenerateSharedKey(&config)
 	noncePub1, nonceShares1, _, _ := ted25519.GenerateSharedNonce(&config, secretShares[0], pub, []byte{})
 	noncePub2, nonceShares2, _, _ := ted25519.GenerateSharedNonce(&config, secretShares[1], pub, []byte{})
