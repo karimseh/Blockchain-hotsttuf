@@ -45,9 +45,9 @@ type Node struct {
 
 	Blockchain *blockchain.Blockchain
 	Mempool    *blockchain.Mempool
-}
 
-var r *Replica
+	Replica *Replica
+}
 
 func NewContext(ctx context.Context, cancel func()) Context {
 	return Context{
@@ -57,7 +57,6 @@ func NewContext(ctx context.Context, cancel func()) Context {
 }
 
 func NewNode(C Context, port int, bootstrap bool) (*Node, error) {
-
 	wallet := wallet.NewWallet()
 	addr, _ := multiaddr.NewMultiaddr(fmt.Sprintf("/ip4/0.0.0.0/tcp/%d", port))
 	privKey, _, _ := crypto.ECDSAKeyPairFromKey(wallet.PrivKey)
@@ -85,8 +84,8 @@ func NewNode(C Context, port int, bootstrap bool) (*Node, error) {
 		Wallet:    wallet,
 		Bootstrap: bootstrap,
 	}, nil
-
 }
+
 func (node *Node) Discover(rendezvous string) {
 	routingDiscovery := discovery.NewRoutingDiscovery(node.Dht)
 	routingDiscovery.Advertise(node.C.Ctx, rendezvous)
@@ -98,20 +97,9 @@ func (node *Node) Discover(rendezvous string) {
 		case <-node.C.Ctx.Done():
 			return
 		case <-ticker.C:
-			log.Printf("Rotuing Discovery ...")
-			log.Print("My Blockchain :", node.Blockchain.String())
-			// dest := types.AddressFromBytes([]byte("TestTestTestTestTest"))
-			// data := []byte("transaction-data")
-			// tx := blockchain.NewTransaction(dest, data)
-			// buf := &bytes.Buffer{}
-			// tx.Encode(blockchain.NewGobTxEncoder(buf))
+			log.Printf("Routing Discovery ...")
+			log.Print("My Blockchain: ", node.Blockchain.String())
 
-			// if node.Bootstrap {
-			// 	node.Broadcast(&Message{
-			// 		Type:    TxMessage,
-			// 		Payload: buf.Bytes(),
-			// 	})
-			// }
 			peers, err := routingDiscovery.FindPeers(node.C.Ctx, rendezvous)
 			if err != nil {
 				log.Fatal(err)
@@ -123,12 +111,10 @@ func (node *Node) Discover(rendezvous string) {
 				if node.Network().Connectedness(p.ID) != network.Connected {
 					err := node.Connect(node.C.Ctx, p)
 					if err != nil {
-						log.Printf("Cannot connect to peer %s\n", p.ID.Pretty())
-
+						log.Printf("Cannot connect to peer %s\n", p.ID.String())
 						continue
 					}
-					log.Printf("Connected to peer %s\n", p.ID.Pretty())
-
+					log.Printf("Connected to peer %s\n", p.ID.String())
 				}
 			}
 		}
@@ -147,7 +133,7 @@ func (node *Node) ConnectToBootsrap(bootstrapPeers []multiaddr.Multiaddr) {
 				log.Printf("Error while connecting to node %q: %-v", peerinfo, err)
 			} else {
 				log.Printf("Connection established with bootstrap node: %q", *peerinfo)
-				//send Init MSG to get keys and initialize replica
+				// Send Init MSG to get keys and initialize replica
 				inf, _ := node.Host.ID().Marshal()
 				msg := Message{
 					Type:    InitMessage,
@@ -161,12 +147,9 @@ func (node *Node) ConnectToBootsrap(bootstrapPeers []multiaddr.Multiaddr) {
 }
 
 func (node *Node) InitDht() error {
-	var options []dht.Option
-	if node.Bootstrap {
-		options = append(options, dht.Mode(dht.ModeServer))
-	}
-
-	kdht, err := dht.New(node.C.Ctx, node.Host, options...)
+	// All nodes run as DHT servers so they actively participate in
+	// routing and peer discovery propagates reliably.
+	kdht, err := dht.New(node.C.Ctx, node.Host, dht.Mode(dht.ModeServer))
 	if err != nil {
 		return err
 	}
@@ -179,46 +162,75 @@ func (node *Node) InitDht() error {
 }
 
 func (node *Node) Start(rendezvous string, bootstrapPeers []multiaddr.Multiaddr) {
-	log.Printf("Host ID: %s", node.ID().Pretty())
+	log.Printf("Host ID: %s", node.ID().String())
 	log.Printf("Connect to me on:")
 	for _, addr := range node.Addrs() {
-		log.Printf("  %s/p2p/%s", addr, node.ID().Pretty())
+		log.Printf("  %s/p2p/%s", addr, node.ID().String())
 	}
+
+	// Init blockchain and mempool first — Replica needs these immediately
+	node.InitBlockchain()
+
 	if err := node.InitDht(); err != nil {
-		log.Printf("DHT Init Error !")
+		log.Printf("DHT Init Error!")
 		panic(err)
 	}
+
 	if node.Bootstrap {
 		ks := node.keyshares[0]
-		r = newReplica(&ks, node)
+		node.Replica = newReplica(&ks, node, NumParties, FaultyThreshold)
 	}
+
+	// Register direct stream handler before connecting so we can
+	// receive InitMessage responses from the bootstrap node
+	node.SetStreamHandler("sharehr", node.handleStream)
+	go node.startPubSub()
+
+	// Write peer ID to file if requested (for Docker orchestration)
+	if peerIDFile := os.Getenv("WRITE_PEER_ID"); peerIDFile != "" {
+		if err := os.WriteFile(peerIDFile, []byte(node.ID().String()), 0644); err != nil {
+			log.Printf("Error writing peer ID file: %v", err)
+		}
+	}
+
 	node.ConnectToBootsrap(bootstrapPeers)
-	node.InitBlockchain()
 	go node.Discover(rendezvous)
-
-	go node.startListening()
-
 	go node.SendTx()
 
-	go node.ProposeBlock()
+	// Wait for Replica to be initialized (non-bootstrap gets it via InitMessage),
+	// then start consensus once enough peers are connected
+	go node.waitForReplicaAndStart()
 
 	c := make(chan os.Signal, 1)
-
 	signal.Notify(c, os.Interrupt, syscall.SIGHUP, syscall.SIGINT, syscall.SIGTERM)
 	<-c
 
 	fmt.Printf("\rExiting...\n")
-
 	node.C.Cancel()
 
 	if err := node.Close(); err != nil {
 		panic(err)
 	}
 	os.Exit(0)
-
 }
-func (node *Node) ProposeBlock() {
-	ticker := time.NewTicker(time.Second * 5)
+
+// waitForReplicaAndStart polls until the Replica is initialized
+// (non-bootstrap nodes receive their key share asynchronously),
+// then starts consensus.
+func (node *Node) waitForReplicaAndStart() {
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	for range ticker.C {
+		if node.Replica != nil {
+			node.Replica.WaitForPeersAndStart()
+			return
+		}
+		log.Printf("Waiting for Replica initialization...")
+	}
+}
+
+func (node *Node) SendTx() {
+	ticker := time.NewTicker(time.Second * 30)
 	defer ticker.Stop()
 
 	for {
@@ -226,114 +238,100 @@ func (node *Node) ProposeBlock() {
 		case <-node.C.Ctx.Done():
 			return
 		case <-ticker.C:
-			if len(node.Peerstore().Peers()) >= 4 && node.ID() == r.p.GetLeader(r.network.Network().Peers(), r.network.ID(), r.p.currLeader) {
-
-				cmd := &bytes.Buffer{}
-				newBlock, _ := node.NextBlock()
-
-				err := newBlock.Encode(blockchain.NewGobBlockEncoder(cmd))
-				if err != nil {
-					fmt.Print("error encoding new block")
-
-				}
-				r.p.OnBeat(cmd.Bytes(), *r)
-				log.Print("On Beat sent")
+			if node.Topic == nil {
+				continue // pubsub not ready yet
 			}
+			tx := NewRandomTx(node.Wallet)
+			buf := &bytes.Buffer{}
+			_ = tx.Encode(blockchain.NewGobTxEncoder(buf))
+			msg := Message{Type: TxMessage, Payload: buf.Bytes()}
+			node.Broadcast(&msg)
 		}
 	}
-
 }
-func (node *Node) SendTx() {
-	if node.Bootstrap {
 
-		ticker := time.NewTicker(time.Second * 30)
-		defer ticker.Stop()
-
-		for {
-			select {
-			case <-node.C.Ctx.Done():
-				return
-			case <-ticker.C:
-				tx := NewRandomTx(node.Wallet)
-				buf := &bytes.Buffer{}
-				_ = tx.Encode(blockchain.NewGobTxEncoder(buf))
-				msg := Message{Type: TxMessage, Payload: buf.Bytes()}
-				node.Broadcast(&msg)
-			}
-		}
-	}
-
-}
+// handleStream processes incoming direct (stream) messages.
+// Direct messages are used for: InitMessage, Vote, Vote2, NewView.
 func (node *Node) handleStream(stream network.Stream) {
 	data, err := io.ReadAll(stream)
 	if err != nil {
-		// Handle error
 		return
 	}
+	_ = stream.Close()
+
 	msg, err := DeserializeMessage(data)
 	if err != nil {
-		// Handle error
 		return
 	}
 
-	// Process the received message
-	// ...
 	switch msg.Type {
 	case InitMessage:
-		if node.Bootstrap {
-			//respond with keys
-			log.Print("received INIT message")
-			peer, err := peer.IDFromBytes(msg.Payload)
-			if err != nil {
-				log.Print("error getting peer id")
-			}
-			m := node.keyshares[node.lastIndexSent]
-			msg := Message{
-				Type:    InitMessage,
-				Payload: ConvertKeyShareToBytes(m),
-			}
-			node.SendMessageToPeer(peer, &msg)
-			if err != nil {
-				log.Print("error sending key share")
-			}
-			node.lastIndexSent++
-		} else {
-			//initiate replica with keys
-			log.Print("received key share")
+		node.handleInitMessage(msg)
 
-			ks, err := DecodeBytesToKeyShare(msg.Payload)
-			if err != nil {
-				log.Print("error decoding key share")
-			}
-
-			r = newReplica(&ks, node)
-			//fmt.Print(r.p.GetLeader(r.network.Network().Peers(), r.p.currLeader))
-		}
 	case BlockMessage:
-		msgBlock := &Msg{}
-		msgBlock, err := DeserializeMsg(msg.Payload)
-
+		// Consensus message received via direct stream
+		consensusMsg, err := DeserializeMsg(msg.Payload)
 		if err != nil {
-			log.Print("error decoding generic message")
+			log.Printf("Error decoding consensus message: %v", err)
+			return
 		}
-		switch msgBlock.Type {
-		case Generic:
-			//On receive vote
-			r.OnReceiveVote(msgBlock)
-		case NewView:
-			r.OnReceiveNewView(msgBlock)
-
-		}
-	case GetDataMessage:
-		//for sync
-
+		node.routeConsensusMsg(consensusMsg)
 	}
-	// Close the stream
-	_ = stream.Close()
 }
 
-func (node *Node) startListening() {
-	node.SetStreamHandler("sharehr", node.handleStream)
+// handleInitMessage handles key share distribution during node bootstrap.
+func (node *Node) handleInitMessage(msg *Message) {
+	if node.Bootstrap {
+		// Bootstrap node: respond with key share
+		log.Print("Received INIT message")
+		peerID, err := peer.IDFromBytes(msg.Payload)
+		if err != nil {
+			log.Print("Error getting peer id")
+			return
+		}
+		m := node.keyshares[node.lastIndexSent]
+		resp := Message{
+			Type:    InitMessage,
+			Payload: ConvertKeyShareToBytes(m),
+		}
+		node.SendMessageToPeer(peerID, &resp)
+		node.lastIndexSent++
+	} else {
+		// Non-bootstrap node: initialize replica with received key share
+		log.Print("Received key share")
+		ks, err := DecodeBytesToKeyShare(msg.Payload)
+		if err != nil {
+			log.Print("Error decoding key share")
+			return
+		}
+		node.Replica = newReplica(&ks, node, NumParties, FaultyThreshold)
+	}
+}
+
+// routeConsensusMsg dispatches a consensus message to the appropriate handler.
+func (node *Node) routeConsensusMsg(msg *Msg) {
+	if node.Replica == nil {
+		log.Print("Replica not initialized, ignoring consensus message")
+		return
+	}
+
+	switch msg.Type {
+	case ProposeMsgType:
+		node.Replica.OnReceiveProposal(msg)
+	case VoteMsgType:
+		node.Replica.OnReceiveVote(msg)
+	case PrepareMsgType:
+		node.Replica.OnReceivePrepare(msg)
+	case Vote2MsgType:
+		node.Replica.OnReceiveVote2(msg)
+	case NewViewMsgType:
+		node.Replica.OnReceiveNewView(msg)
+	default:
+		log.Printf("Unknown consensus message type: %d", msg.Type)
+	}
+}
+
+func (node *Node) startPubSub() {
 	ps, err := pubsub.NewGossipSub(node.C.Ctx, node.Host)
 	if err != nil {
 		panic(err)
@@ -341,18 +339,19 @@ func (node *Node) startListening() {
 
 	topic, err := ps.Join("sharehr")
 	if err != nil {
-		fmt.Print("error topic join")
+		log.Printf("Error joining topic: %v", err)
+		return
 	}
 	node.Topic = topic
 
 	sub, err := node.Topic.Subscribe()
 	if err != nil {
-		fmt.Print("error topic subscribe")
+		log.Printf("Error subscribing to topic: %v", err)
+		return
 	}
 	node.Subscription = sub
 
 	node.HandleBroadcast()
-
 }
 
 func (node *Node) SendMessageToPeer(peerID peer.ID, msg *Message) error {
@@ -371,15 +370,9 @@ func (node *Node) SendMessageToPeer(peerID peer.ID, msg *Message) error {
 		return err
 	}
 
-	err = stream.Close()
-	if err != nil {
-		return err
-	}
-
-	return nil
+	return stream.Close()
 }
 
-// broadcast
 func (node *Node) Broadcast(msg *Message) {
 	msgToBytes, _ := SerializeMessage(msg)
 	if err := node.Topic.Publish(node.C.Ctx, msgToBytes); err != nil {
@@ -387,43 +380,65 @@ func (node *Node) Broadcast(msg *Message) {
 	}
 }
 
-// receive Broadcast
+// HandleBroadcast processes incoming broadcast (pubsub) messages.
+// Broadcast is used for: TxMessage, Propose, Prepare.
 func (node *Node) HandleBroadcast() {
 	for {
 		m, err := node.Subscription.Next(node.C.Ctx)
 		if err != nil {
-			panic(err)
+			log.Printf("Subscription error: %v", err)
+			return
 		}
 		msg, err := DeserializeMessage(m.Message.Data)
 		if err != nil {
-			fmt.Print("Error deserilazing msg")
+			log.Printf("Error deserializing broadcast: %v", err)
+			continue
 		}
+
 		switch msg.Type {
 		case BlockMessage:
-			msgBlock := &Msg{}
-			msgBlock, err := DeserializeMsg(msg.Payload)
-
+			consensusMsg, err := DeserializeMsg(msg.Payload)
 			if err != nil {
-				fmt.Print("error decoding msg")
+				log.Printf("Error decoding consensus message: %v", err)
+				continue
 			}
-			switch msgBlock.Type {
-			case Generic:
-				//OnReceiveProposal
-				r.OnReceiveProppsal(msgBlock)
-			}
-		case TxMessage:
-			log.Print("received TX mssage")
-			tx := new(blockchain.Transaction)
-			tx.Decode(blockchain.NewGobTxDecoder(bytes.NewReader(msg.Payload)))
-			node.Mempool.AddTx(tx)
-			//if leader create block.
+			node.routeConsensusMsg(consensusMsg)
 
+		case TxMessage:
+			tx := new(blockchain.Transaction)
+			if err := tx.Decode(blockchain.NewGobTxDecoder(bytes.NewReader(msg.Payload))); err != nil {
+				log.Printf("Error decoding transaction: %v", err)
+				continue
+			}
+			if err := node.Mempool.AddTx(tx); err != nil {
+				log.Printf("Rejected transaction: %v", err)
+				continue
+			}
+			log.Printf("Transaction added to mempool (size: %d)", node.Mempool.Len())
 		}
 	}
 }
 
+// --- Transport interface implementation for *Node ---
+
+func (node *Node) Peers() peer.IDSlice {
+	return node.Network().Peers()
+}
+
+func (node *Node) GetBlockchain() *blockchain.Blockchain {
+	return node.Blockchain
+}
+
+func (node *Node) GetMempool() *blockchain.Mempool {
+	return node.Mempool
+}
+
+func (node *Node) GetWallet() wallet.Wallet {
+	return node.Wallet
+}
+
 func (node *Node) InitBlockchain() {
-	log.Printf("initialization of blockchain")
+	log.Printf("Initializing blockchain")
 	h := blockchain.Header{
 		TxHash:        blockchain.Hash{},
 		PrevBlockHash: blockchain.Hash{},
@@ -434,20 +449,4 @@ func (node *Node) InitBlockchain() {
 
 	node.Blockchain = blockchain.NewBlockchain(genesis)
 	node.Mempool = blockchain.NewMempool()
-}
-
-func (node *Node) NextBlock() (*blockchain.Block, error) {
-
-	lastHeader := node.Blockchain.GetLastHeader()
-	txs := node.Mempool.GetTxs()
-	fmt.Print(txs)
-	newBlock, err := blockchain.NewBlockFromPreviousHeader(lastHeader, txs)
-	newBlock.Sign(node.Wallet)
-	if err != nil {
-		log.Print("error creating block!!")
-		return nil, err
-	}
-
-	return newBlock, nil
-
 }
