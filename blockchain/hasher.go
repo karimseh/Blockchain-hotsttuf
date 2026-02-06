@@ -22,6 +22,10 @@ func (h Hash) ToSlice() []byte {
 	return b
 }
 
+func (h Hash) IsZero() bool {
+	return h == Hash{}
+}
+
 func (TxHasher) Hash(tx *Transaction) Hash {
 	buf := new(bytes.Buffer)
 

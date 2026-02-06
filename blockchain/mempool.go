@@ -16,17 +16,21 @@ func NewMempool() *Mempool {
 	}
 }
 
-func (m *Mempool) AddTx(tx *Transaction) {
+func (m *Mempool) AddTx(tx *Transaction) error {
+	if err := tx.Verify(); err != nil {
+		return fmt.Errorf("transaction verification failed: %w", err)
+	}
+
 	m.lock.Lock()
 	defer m.lock.Unlock()
 
-	_, ok := m.txs[tx.Hash(TxHasher{})]
-	if ok {
-		fmt.Print("tx already in mempool")
-		return
+	hash := tx.Hash(TxHasher{})
+	if _, ok := m.txs[hash]; ok {
+		return fmt.Errorf("transaction already in mempool")
 	}
 
-	m.txs[tx.Hash(TxHasher{})] = tx
+	m.txs[hash] = tx
+	return nil
 }
 
 func (m *Mempool) DeleteTx(tx *Transaction) {

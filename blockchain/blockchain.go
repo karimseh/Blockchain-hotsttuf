@@ -32,15 +32,40 @@ func NewBlockchain(genesis *Block) *Blockchain {
 
 func (bc *Blockchain) Addblock(b *Block) error {
 	bc.lock.Lock()
-	//adding genesis block
+	defer bc.lock.Unlock()
+
+	if len(bc.headers) == 0 {
+		// Genesis block: accept if PrevBlockHash is zero
+		if !b.PrevBlockHash.IsZero() {
+			return fmt.Errorf("genesis block must have zero PrevBlockHash")
+		}
+	} else {
+		// Non-genesis: validate chain continuity
+		lastHeader := bc.headers[len(bc.headers)-1]
+
+		expectedPrevHash := BlockHasher{}.Hash(lastHeader)
+		if b.PrevBlockHash != expectedPrevHash {
+			return fmt.Errorf(
+				"invalid PrevBlockHash: got %x, expected %x",
+				b.PrevBlockHash, expectedPrevHash,
+			)
+		}
+
+		expectedHeight := lastHeader.BestHeight + 1
+		if b.BestHeight != expectedHeight {
+			return fmt.Errorf(
+				"invalid block height: got %d, expected %d",
+				b.BestHeight, expectedHeight,
+			)
+		}
+	}
+
 	bc.headers = append(bc.headers, b.Header)
 	bc.blocks = append(bc.blocks, b)
 	bc.blockStore[b.Hash(BlockHasher{})] = b
-
 	for _, tx := range b.Transactions {
 		bc.txStore[tx.Hash(TxHasher{})] = tx
 	}
-	bc.lock.Unlock()
 	return nil
 }
 
@@ -51,8 +76,8 @@ func (bc *Blockchain) Height() uint32 {
 }
 
 func (bc *Blockchain) GetTxByHash(hash Hash) (*Transaction, error) {
-	bc.lock.Lock()
-	defer bc.lock.Unlock()
+	bc.lock.RLock()
+	defer bc.lock.RUnlock()
 
 	tx, ok := bc.txStore[hash]
 
@@ -65,8 +90,8 @@ func (bc *Blockchain) GetTxByHash(hash Hash) (*Transaction, error) {
 }
 
 func (bc *Blockchain) GetBlockByHash(hash Hash) (*Block, error) {
-	bc.lock.Lock()
-	defer bc.lock.Unlock()
+	bc.lock.RLock()
+	defer bc.lock.RUnlock()
 
 	block, ok := bc.blockStore[hash]
 
@@ -79,7 +104,9 @@ func (bc *Blockchain) GetBlockByHash(hash Hash) (*Block, error) {
 }
 
 func (bc *Blockchain) GetLastHeader() *Header {
-	return bc.headers[bc.Height()]
+	bc.lock.RLock()
+	defer bc.lock.RUnlock()
+	return bc.headers[len(bc.headers)-1]
 }
 
 func (bc *Blockchain) String() string {
