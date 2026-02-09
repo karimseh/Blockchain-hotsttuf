@@ -1,0 +1,60 @@
+services:
+  bootstrap:
+    build: .
+    container_name: sharehr-bootstrap
+    environment:
+      - ROLE=bootstrap
+      - PORT=4001
+    volumes:
+      - shared-data:/shared
+    networks:
+      - sharehr-net
+
+  node1:
+    build: .
+    container_name: sharehr-node1
+    environment:
+      - ROLE=node
+      - PORT=4002
+      - BOOTSTRAP_PORT=4001
+    volumes:
+      - shared-data:/shared
+    depends_on:
+      - bootstrap
+    networks:
+      - sharehr-net
+
+  node2:
+    build: .
+    container_name: sharehr-node2
+    environment:
+      - ROLE=node
+      - PORT=4003
+      - BOOTSTRAP_PORT=4001
+    volumes:
+      - shared-data:/shared
+    depends_on:
+      - bootstrap
+    networks:
+      - sharehr-net
+
+  node3:
+    build: .
+    container_name: sharehr-node3
+    environment:
+      - ROLE=node
+      - PORT=4004
+      - BOOTSTRAP_PORT=4001
+    volumes:
+      - shared-data:/shared
+    depends_on:
+      - bootstrap
+    networks:
+      - sharehr-net
+
+volumes:
+  shared-data:
+
+networks:
+  sharehr-net:
+    driver: bridge
